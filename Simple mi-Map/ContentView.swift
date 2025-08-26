@@ -132,6 +132,8 @@ final class MindMapVM: ObservableObject {
     @Published var isEraseMode = false
     @Published var eraseFrom: UUID? = nil
     @Published var selectedEdgeID: UUID? = nil
+    
+    @Published var secondarySelected: UUID? = nil
 
     // Undo/Redo stacks
     private var undoStack: [MindMap] = []
@@ -234,25 +236,29 @@ final class MindMapVM: ObservableObject {
     }
 
     func deleteSelection() {
-        if let edgeID = selectedEdgeID {
-            // 選択中のエッジだけ削除
-            recordUndo()
-            map.edges.removeAll { $0.id == edgeID }
-            selectedEdgeID = nil
-            save()
-            return
-        }
         guard let id = selected else { return }
         recordUndo()
         map.edges.removeAll { $0.from == id || $0.to == id }
         map.nodes.removeAll { $0.id == id }
         selected = nil
+        secondarySelected = nil
         save()
     }
 
-    // Check if a node has any connected edges
-    func hasEdges(for id: UUID) -> Bool {
-        map.edges.contains { $0.from == id || $0.to == id }
+    // 2ノード間にエッジがあるか（向きはどちらでもOK）
+    func hasEdge(between a: UUID, and b: UUID) -> Bool {
+        map.edges.contains { ($0.from == a && $0.to == b) || ($0.from == b && $0.to == a) }
+    }
+
+    // 現在選択されている2ノード間のエッジを削除
+    func deleteEdgeBetweenSelectedNodes() {
+        guard let a = selected, let b = secondarySelected, a != b else { return }
+        let before = map.edges.count
+        if before > 0 {
+            recordUndo()
+            map.edges.removeAll { ($0.from == a && $0.to == b) || ($0.from == b && $0.to == a) }
+            if map.edges.count != before { save() }
+        }
     }
 
     // Remove all edges connected to a given node id
@@ -407,7 +413,14 @@ final class MindMapVM: ObservableObject {
             map = try JSONDecoder().decode(MindMap.self, from: data)
             if let c = map.nodes.last?.color { lastNodeColor = c }
         } catch {
-            // 初回起動などは無視
+            // ボードファイルが無い／壊れている場合は初期マップを生成して保存
+            map = MindMap(
+                nodes: [MindNode(title: "メインアイデア",
+                                 position: .from(.zero),
+                                 color: lastNodeColor)],
+                edges: []
+            )
+            save()
         }
         clearHistory()
     }
@@ -434,14 +447,41 @@ final class MindMapVM: ObservableObject {
         }
     }
     
+    // Generate a unique board name like "名前", "名前 (2)", "名前 (3)" ...
+    private func makeUniqueName(_ base: String, excluding excludeID: UUID? = nil) -> String {
+        let baseName = base.isEmpty ? "新規ボード" : base
+        var used = Set<Int>() // 1 means "base", 2 means "base (2)", etc.
+        for b in boards where b.id != excludeID {
+            if b.name == baseName {
+                used.insert(1)
+            } else if b.name.hasPrefix(baseName + " (") && b.name.hasSuffix(")") {
+                let start = baseName.count + 2 // skip "base ("
+                let end = b.name.count - 1     // drop ")"
+                if start < end {
+                    let numStr = String(b.name[b.name.index(b.name.startIndex, offsetBy: start)..<b.name.index(b.name.startIndex, offsetBy: end)])
+                    if let n = Int(numStr) { used.insert(n) }
+                }
+            }
+        }
+        var n = 1
+        while used.contains(n) { n += 1 }
+        return n == 1 ? baseName : "\(baseName) (\(n))"
+    }
+
     // MARK: - Board operations
     @discardableResult
     func createBoard(name: String) -> UUID {
-        let meta = BoardMeta(name: name.isEmpty ? "新規ボード" : name,
+        // まず現在のボードを保存（作業の取りこぼし防止）
+        save()
+        let finalName = makeUniqueName(name)
+        let meta = BoardMeta(name: finalName,
                              fileName: "board_\(UUID().uuidString).json")
         boards.append(meta)
         currentBoardID = meta.id
-        map = MindMap(nodes: [MindNode(title: "メインアイデア", position: .from(.zero), color: RGBA.from(.yellow.opacity(0.9)))], edges: [])
+        map = MindMap(nodes: [MindNode(title: "メインアイデア",
+                                       position: .from(.zero),
+                                       color: RGBA.from(.yellow.opacity(0.9)))],
+                      edges: [])
         save()
         saveBoards()
         persistCurrentBoardID()
@@ -451,7 +491,9 @@ final class MindMapVM: ObservableObject {
     @discardableResult
     func duplicateCurrentBoard() -> UUID? {
         guard let cur = currentBoardID, let metaCur = boards.first(where: { $0.id == cur }) else { return nil }
-        let newMeta = BoardMeta(name: "複製 - \(metaCur.name)", fileName: "board_\(UUID().uuidString).json")
+        let dupBase = "複製 - \(metaCur.name)"
+        let newMeta = BoardMeta(name: makeUniqueName(dupBase),
+                                fileName: "board_\(UUID().uuidString).json")
         boards.append(newMeta)
         currentBoardID = newMeta.id
         // copy current map content
@@ -470,17 +512,36 @@ final class MindMapVM: ObservableObject {
 
     func switchBoard(to id: UUID) {
         guard boards.contains(where: { $0.id == id }) else { return }
-        save()                // 現在のボードを保存
+        // 現在のボードを保存
+        save()
+        // 切り替え
         currentBoardID = id
-        load()                // 新しいボードを読み込み
+        // 新ボードを読み込み
+        load()
+        // 見た目と選択状態をリセット（切替が分かりやすい）
+        selected = nil
+        selectedEdgeID = nil
+        isConnectMode = false
+        isEraseMode = false
+        connectFrom = nil
+        connectFromAnchor = nil
+        eraseFrom = nil
+        zoom = 1.0
+        pan = .zero
+        // 永続化と履歴クリア
         persistCurrentBoardID()
         clearHistory()
+        // 念のため更新通知
+        objectWillChange.send()
     }
 
     func renameBoard(id: UUID, to newName: String) {
         guard let idx = boards.firstIndex(where: { $0.id == id }) else { return }
-        if !newName.isEmpty {
-            boards[idx].name = newName
+        let base = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !base.isEmpty else { return }
+        let unique = makeUniqueName(base, excluding: id)
+        if boards[idx].name != unique {
+            boards[idx].name = unique
             saveBoards()
         }
     }
@@ -643,127 +704,150 @@ struct ContentView: View {
     @State private var showRenameBoardAlert = false
     @State private var renameBoardText: String = ""
     @AppStorage("toolbarLabelStyle") private var toolbarLabelStyle: String = "titleAndIcon" // or "iconOnly"
+    @SceneStorage("sceneBoardID") private var sceneBoardID: String?
+    @State private var didRestoreFromScene = false
 
     var body: some View {
-        NavigationStack {
-            GeometryReader { geo in
-                ZStack {
-                    if vm.showGrid { GridBackground(zoom: vm.zoom, pan: vm.pan) }
+        Group {
+            NavigationStack {
+                GeometryReader { geo in
+                    ZStack {
+                        if vm.showGrid { GridBackground(zoom: vm.zoom, pan: vm.pan) }
 
-                    // World content (edges + nodes) with transforms
-                    WorldContent(
-                        vm: vm,
-                        zoom: vm.zoom * gestureZoom,
-                        pan: vm.pan + gesturePan
-                    )
-                }
-                .animation(.interactiveSpring(response: 0.25, dampingFraction: 0.9), value: gesturePan)
-                .animation(.interactiveSpring(response: 0.25, dampingFraction: 0.9), value: gestureZoom)
-                .onAppear { canvasSize = geo.size }
-                .contentShape(Rectangle())
-                .gesture(canvasGestures())
-                .onTapGesture { location in
-                    if vm.isAddMode {
-                        let totalZoom = max(0.01, vm.zoom * gestureZoom)
-                        let totalPan = vm.pan + gesturePan
-                        let worldX = (location.x - totalPan.width) / totalZoom
-                        let worldY = (location.y - totalPan.height) / totalZoom
-                        vm.addNode(at: CGPoint(x: worldX, y: worldY))
+                        // World content (edges + nodes) with transforms
+                        WorldContent(
+                            vm: vm,
+                            zoom: vm.zoom * gestureZoom,
+                            pan: vm.pan + gesturePan
+                        )
                     }
-                }
-            #if os(macOS)
-                .overlay(
-                    ScrollWheelCatcher { dx, dy, shift, precise in
-                        // Adjusted: invert direction per user feedback (natural: wheel up -> view goes up)
-                        let factor: CGFloat = precise ? 2.0 : 20.0
-                        var p = vm.pan
-
-                        if shift {
-                            // Shift: horizontal only. Pick the dominant axis and move accordingly (no sign inversion).
-                            let h = abs(dx) >= abs(dy) ? dx : dy
-                            p.width += h * factor
+                    .animation(.interactiveSpring(response: 0.25, dampingFraction: 0.9), value: gesturePan)
+                    .animation(.interactiveSpring(response: 0.25, dampingFraction: 0.9), value: gestureZoom)
+                    .onAppear {
+                        canvasSize = geo.size
+                        // 初回だけ SceneStorage 復元（手動切替の直後に巻き戻らないように）
+                        if !didRestoreFromScene {
+                            if let raw = sceneBoardID, let id = UUID(uuidString: raw), id != vm.currentBoardID {
+                                vm.switchBoard(to: id)
+                            }
+                            didRestoreFromScene = true
+                        }
+                    }
+                    .contentShape(Rectangle())
+                    .gesture(canvasGestures())
+                    .onTapGesture { location in
+                        if vm.isAddMode {
+                            let totalZoom = max(0.01, vm.zoom * gestureZoom)
+                            let totalPan = vm.pan + gesturePan
+                            let worldX = (location.x - totalPan.width) / totalZoom
+                            let worldY = (location.y - totalPan.height) / totalZoom
+                            vm.addNode(at: CGPoint(x: worldX, y: worldY))
                         } else {
-                            // Free pan: apply raw deltas (no minus) so wheel up -> view moves up
-                            if abs(dx) > 0.01 { p.width += dx * factor }
-                            p.height += dy * factor
-                        }
-
-                        withAnimation(.interactiveSpring(response: 0.2, dampingFraction: 0.9)) {
-                            vm.pan = p
+                            // 背景クリックで選択解除
+                            vm.selected = nil
+                            vm.secondarySelected = nil
+                            vm.selectedEdgeID = nil
                         }
                     }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-                )
-                .overlay(
-                    KeyEventCatcher(
-                        onUndo: { if vm.editorTarget == nil { vm.undo() } },
-                        onRedo: { if vm.editorTarget == nil { vm.redo() } }
+#if os(macOS)
+                    .overlay(
+                        ScrollWheelCatcher { dx, dy, shift, precise in
+                            // Adjusted: invert direction per user feedback (natural: wheel up -> view goes up)
+                            let factor: CGFloat = precise ? 2.0 : 20.0
+                            var p = vm.pan
+
+                            if shift {
+                                // Shift: horizontal only. Pick the dominant axis and move accordingly (no sign inversion).
+                                let h = abs(dx) >= abs(dy) ? dx : dy
+                                p.width += h * factor
+                            } else {
+                                // Free pan: apply raw deltas (no minus) so wheel up -> view moves up
+                                if abs(dx) > 0.01 { p.width += dx * factor }
+                                p.height += dy * factor
+                            }
+
+                            withAnimation(.interactiveSpring(response: 0.2, dampingFraction: 0.9)) {
+                                vm.pan = p
+                            }
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
                     )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-                )
-                .overlay(
-                    VStack(spacing: 0) {
-                        // Invisible buttons to bind Command-Z / Shift-Command-Z
-                        Button(action: { if vm.editorTarget == nil { vm.undo() } }) {
-                            EmptyView()
-                        }
-                        .keyboardShortcut("z", modifiers: .command)
-                        .disabled(false)
+                    .overlay(
+                        KeyEventCatcher(
+                            onUndo: { if vm.editorTarget == nil { vm.undo() } },
+                            onRedo: { if vm.editorTarget == nil { vm.redo() } }
+                        )
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                    )
+                    .overlay(
+                        VStack(spacing: 0) {
+                            // Invisible buttons to bind Command-Z / Shift-Command-Z
+                            Button(action: { if vm.editorTarget == nil { vm.undo() } }) {
+                                EmptyView()
+                            }
+                            .keyboardShortcut("z", modifiers: .command)
+                            .disabled(false)
 
-                        Button(action: { if vm.editorTarget == nil { vm.redo() } }) {
-                            EmptyView()
+                            Button(action: { if vm.editorTarget == nil { vm.redo() } }) {
+                                EmptyView()
+                            }
+                            .keyboardShortcut("Z", modifiers: [.command, .shift])
+                            .disabled(false)
                         }
-                        .keyboardShortcut("Z", modifiers: [.command, .shift])
-                        .disabled(false)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .opacity(0.001)
-                    .allowsHitTesting(false)
-                )
-            #endif
-                .toolbar { toolbar(geo: geo) }
-                .navigationTitle("Simple mi-Map")
-                #if !os(macOS)
-                .navigationBarTitleDisplayMode(.inline)
-                #endif
-                .onReceive(vm.$map.dropFirst()) { _ in vm.save() }
-                .sheet(item: $vm.editorTarget) { n in
-                    NodeEditor(node: n) { updated in
-                        if let idx = vm.map.nodes.firstIndex(where: { $0.id == updated.id }) {
-                            vm.recordUndo()
-                            vm.map.nodes[idx] = updated
-                            vm.lastNodeColor = updated.color
-                            vm.save()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .opacity(0.001)
+                        .allowsHitTesting(false)
+                    )
+#endif
+                    .toolbar { toolbar(geo: geo) }
+                    .navigationTitle(vm.boards.first(where: { $0.id == vm.currentBoardID })?.name ?? "Simple mi-Map")
+#if !os(macOS)
+                    .navigationBarTitleDisplayMode(.inline)
+#endif
+                    .onReceive(vm.$map.dropFirst()) { _ in vm.save() }
+                    .sheet(item: $vm.editorTarget) { n in
+                        NodeEditor(node: n) { updated in
+                            if let idx = vm.map.nodes.firstIndex(where: { $0.id == updated.id }) {
+                                vm.recordUndo()
+                                vm.map.nodes[idx] = updated
+                                vm.lastNodeColor = updated.color
+                                vm.save()
+                            }
                         }
+                        .presentationDetents([.medium, .large])
                     }
-                    .presentationDetents([.medium, .large])
-                }
-                .alert("PNGを書き出しました", isPresented: $exportAlert.0) {
-                    Button("OK", role: .cancel) {}
-                } message: {
-                    if let url = exportAlert.1 { Text(url.path) }
-                }
-                .alert("ボード名を変更", isPresented: $showRenameBoardAlert) {
-                    TextField("名前", text: $renameBoardText)
-                    Button("保存") {
-                        if let id = vm.currentBoardID { vm.renameBoard(id: id, to: renameBoardText) }
+                    .alert("PNGを書き出しました", isPresented: $exportAlert.0) {
+                        Button("OK", role: .cancel) {}
+                    } message: {
+                        if let url = exportAlert.1 { Text(url.path) }
                     }
-                    Button("キャンセル", role: .cancel) {}
-                }
-                .alert("現在のボードを削除しますか？", isPresented: $showDeleteBoardConfirm) {
-                    Button("削除", role: .destructive) {
-                        if let id = vm.currentBoardID { vm.deleteBoard(id: id) }
+                    .alert("ボード名を変更", isPresented: $showRenameBoardAlert) {
+                        TextField("名前", text: $renameBoardText)
+                        Button("保存") {
+                            if let id = vm.currentBoardID { vm.renameBoard(id: id, to: renameBoardText) }
+                        }
+                        Button("キャンセル", role: .cancel) {}
                     }
-                    Button("キャンセル", role: .cancel) {}
-                } message: {
-                    Text("最後の1枚は削除できません。")
+                    .alert("現在のボードを削除しますか？", isPresented: $showDeleteBoardConfirm) {
+                        Button("削除", role: .destructive) {
+                            if let id = vm.currentBoardID { vm.deleteBoard(id: id) }
+                        }
+                        Button("キャンセル", role: .cancel) {}
+                    } message: {
+                        Text("最後の1枚は削除できません。")
+                    }
+                    .onChange(of: vm.currentBoardID) { _, newValue in
+                        sceneBoardID = newValue?.uuidString
+                    }
                 }
             }
         }
+        // ボードIDが変わったらビュー階層全体を再構築
+        .id(vm.currentBoardID ?? UUID())
     }
 
     // MARK: Gestures
@@ -843,9 +927,16 @@ struct ContentView: View {
             } label: {
                 Label("PNG書き出し", systemImage: "square.and.arrow.down")
             }
+            
+            Button {
+                vm.deleteEdgeBetweenSelectedNodes()
+            } label: {
+                Label("エッジ削除", systemImage: "scissors")
+            }
+            .disabled(!(vm.selected != nil && vm.secondarySelected != nil && { let a = vm.selected!, b = vm.secondarySelected!; return vm.hasEdge(between: a, and: b) }()))
 
-            Button(role: .destructive) { vm.deleteSelection() } label: { Label("削除", systemImage: "trash") }
-                .disabled(vm.selected == nil && vm.selectedEdgeID == nil)
+            Button(role: .destructive) { vm.deleteSelection() } label: { Label("ノード削除", systemImage: "trash") }
+                .disabled(vm.selected == nil)
             
             Menu {
                 // Quick select list
@@ -897,8 +988,7 @@ struct ContentView: View {
         panel.canCreateDirectories = true
         panel.showsTagField = false
         panel.isExtensionHidden = false
-        panel.allowedFileTypes = ["png"]
-        panel.allowsOtherFileTypes = false
+        panel.allowedContentTypes = [UTType.png]
         panel.nameFieldStringValue = defaultName
         return panel.runModal() == .OK ? panel.url : nil
     }
@@ -960,6 +1050,7 @@ struct ToolbarIconLabel: View {
 struct NodeView: View {
     var node: MindNode
     var selected: Bool
+    var secondary: Bool
     var connectFrom: Bool
 
     var body: some View {
@@ -976,7 +1067,12 @@ struct NodeView: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(connectFrom ? .blue : (selected ? Color.accentColor : .secondary.opacity(0.5)), lineWidth: connectFrom ? 3 : (selected ? 2.5 : 1))
+                    .stroke(
+                        connectFrom ? .blue :
+                        (selected ? Color.accentColor :
+                         (secondary ? Color.orange : .secondary.opacity(0.5))),
+                        lineWidth: connectFrom ? 3 : (selected ? 2.5 : (secondary ? 2 : 1))
+                    )
             )
             .animation(.spring(duration: 0.25), value: selected)
             .animation(.spring(duration: 0.25), value: connectFrom)
@@ -1057,38 +1153,52 @@ struct WorldContent: View {
                 NodeView(
                     node: node,
                     selected: vm.selected == node.id,
-                    connectFrom: (vm.connectFrom == node.id) || (vm.eraseFrom == node.id) // ←ここ変更
+                    secondary: vm.secondarySelected == node.id,
+                    connectFrom: (vm.connectFrom == node.id) || (vm.eraseFrom == node.id)
                 )
-                    .position(node.position.cgPoint)
-                    .onTapGesture(count: 2) { vm.editorTarget = node }
-                    .onTapGesture {
-                        if vm.isEraseMode {
-                            if vm.eraseFrom == nil {
-                                vm.beginErase(from: node)
-                            } else {
-                                vm.finishErase(to: node)
-                            }
-                        } else if vm.isConnectMode {
-                            if vm.connectFrom == nil {
-                                vm.beginSimpleConnect(from: node)
-                            } else {
-                                vm.finishConnection(to: node)
-                            }
+                .position(node.position.cgPoint)
+                .onTapGesture(count: 2) { vm.editorTarget = node }
+                .onTapGesture {
+                    if vm.isEraseMode {
+                        if vm.eraseFrom == nil {
+                            vm.beginErase(from: node)
                         } else {
-                            vm.selectedEdgeID = nil
+                            vm.finishErase(to: node)
+                        }
+                    } else if vm.isConnectMode {
+                        if vm.connectFrom == nil {
+                            vm.beginSimpleConnect(from: node)
+                        } else {
+                            vm.finishConnection(to: node)
+                        }
+                    } else {
+                        // 二重選択の更新
+                        vm.selectedEdgeID = nil
+                        if vm.selected == nil {
                             vm.selected = node.id
+                            vm.secondarySelected = nil
+                        } else if vm.selected == node.id {
+                            // 1つ目を再タップ → 単独選択のまま
+                            vm.secondarySelected = nil
+                        } else if vm.secondarySelected == nil {
+                            vm.secondarySelected = node.id
+                        } else {
+                            // 3つ目を選んだら「新規を第1」に、セカンダリはクリア
+                            vm.selected = node.id
+                            vm.secondarySelected = nil
                         }
                     }
-                    .gesture(
-                        DragGesture(minimumDistance: 4)
-                            .onChanged { value in
-                                vm.beginDrag(node)
-                                vm.drag(node, translation: value.translation)
-                            }
-                            .onEnded { _ in
-                                vm.endDrag(node)
-                            }
-                    )
+                }
+                .gesture(
+                    DragGesture(minimumDistance: 4)
+                        .onChanged { value in
+                            vm.beginDrag(node)
+                            vm.drag(node, translation: value.translation)
+                        }
+                        .onEnded { _ in
+                            vm.endDrag(node)
+                        }
+                )
             }
         }
         .scaleEffect(zoom)
@@ -1114,7 +1224,7 @@ struct ExportView: View {
                     }
                 }
                 ForEach(map.nodes, id: \.id) { node in
-                    NodeView(node: node, selected: false, connectFrom: false)
+                    NodeView(node: node, selected: false, secondary: false, connectFrom: false)
                         .position(node.position.cgPoint)
                 }
             }
